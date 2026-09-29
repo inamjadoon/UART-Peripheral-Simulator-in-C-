@@ -1,0 +1,620 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  keepspaces=true
+}
+
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\lineitem}[2]{\textbf{Line #1:} #2\\}
+
+\title{UARTSim Code Explanation}
+\author{Generated Documentation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Overall Context}
+UARTSim is a small console project that simulates a very simple UART transfer between two UART objects. The program is intentionally kept small:
+\begin{itemize}[leftmargin=*]
+  \item \file{src/main.cpp} drives the whole demo and user interaction.
+  \item \file{include/Uart.hpp} defines the UART class, its registers, and its behavior.
+  \item \file{include/Bus.hpp} defines a tiny bus that calls \texttt{tick()} on each UART.
+  \item \file{include/CircularBuffer.hpp} defines a small reusable circular buffer template used by UART for TX/RX storage.
+\end{itemize}
+
+The data flow is:
+\begin{enumerate}[leftmargin=*]
+  \item The user enters UART options in the console menu.
+  \item \texttt{main.cpp} creates two UART objects and a bus.
+  \item One UART queues the message into its TX buffer.
+  \item The bus repeatedly calls \texttt{tick()} on each UART.
+  \item Each tick moves one byte from TX to the peer's RX buffer, or to itself in loopback mode.
+  \item The program prints the received message and a register report.
+\end{enumerate}
+
+\section*{File: src/main.cpp}
+\begin{lstlisting}[style=code]
+#include "../include/Bus.hpp"
+#include "../include/Uart.hpp"
+
+#include <cstdint>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+using namespace std;
+
+namespace {
+string readLineOrDefault(const string& prompt, const string& fallback) {
+    cout << prompt << " [" << fallback << "]: ";
+    string text;
+    if (!getline(cin, text) || text.empty()) {
+        return fallback;
+    }
+    return text;
+}
+
+int readIntOrDefault(const string& prompt, int fallback, int minValue, int maxValue) {
+    while (true) {
+        cout << prompt << " [" << fallback << "]: ";
+        string text;
+        if (!getline(cin, text) || text.empty()) {
+            return fallback;
+        }
+
+        stringstream stream(text);
+        int value = 0;
+        char extra = '\0';
+        if (stream >> value && !(stream >> extra) && value >= minValue && value <= maxValue) {
+            return value;
+        }
+
+        cout << "Please enter a number from " << minValue << " to " << maxValue << ".\n";
+    }
+}
+
+bool readYesNoOrDefault(const string& prompt, bool fallback) {
+    const string fallbackText = fallback ? "y" : "n";
+    while (true) {
+        cout << prompt << " [" << fallbackText << "]: ";
+        string text;
+        if (!getline(cin, text) || text.empty()) {
+            return fallback;
+        }
+
+        if (text == "y" || text == "Y" || text == "yes" || text == "YES") {
+            return true;
+        }
+        if (text == "n" || text == "N" || text == "no" || text == "NO") {
+            return false;
+        }
+
+        cout << "Please enter y or n.\n";
+    }
+}
+
+Uart::ParityMode parityFromChoice(int choice) {
+    if (choice == 1) {
+        return Uart::ParityMode::Even;
+    }
+    if (choice == 2) {
+        return Uart::ParityMode::Odd;
+    }
+    return Uart::ParityMode::None;
+}
+
+string parityName(Uart::ParityMode mode) {
+    if (mode == Uart::ParityMode::Even) {
+        return "even";
+    }
+    if (mode == Uart::ParityMode::Odd) {
+        return "odd";
+    }
+    return "none";
+}
+
+string formatStatus(Uart::Registers registers) {
+    stringstream out;
+    out << "0x" << hex << registers.status << dec;
+    out << " [TX_BUSY=" << ((registers.status & Uart::StatusTxBusy) != 0U ? "1" : "0")
+        << ", RX_READY=" << ((registers.status & Uart::StatusRxReady) != 0U ? "1" : "0")
+        << ", OVERFLOW=" << ((registers.status & Uart::StatusBufferOverflow) != 0U ? "1" : "0") << "]";
+    return out.str();
+}
+
+void printStatusPhase(const string& label, const Uart& uart) {
+    cout << label << " STATUS = " << formatStatus(uart.registers()) << '\n';
+}
+
+void printBuffer(Uart& uart) {
+    uint8_t byte = 0U;
+    while (uart.readReceivedByte(byte)) {
+        cout << static_cast<char>(byte);
+    }
+}
+
+void printRegisterReport(const Uart& uart, const string& receiverName) {
+    const Uart::Registers registers = uart.registers();
+    const Uart::Config config = uart.config();
+
+    cout << "\nRegister report for " << uart.name() << "\n";
+    cout << "CONTROL = 0x" << hex << registers.control << dec << '\n';
+    cout << "  parity enable: " << (config.parityEnabled ? "set" : "clear")
+         << " because parity was " << parityName(config.parity) << '\n';
+    cout << "  parity odd: " << ((registers.control & Uart::ControlParityOdd) != 0U ? "set" : "clear")
+         << " because " << parityName(config.parity) << " parity uses the odd bit only when needed" << '\n';
+    cout << "  stop bits: " << static_cast<int>(config.stopBits)
+         << " because the menu selected that frame length" << '\n';
+    cout << "  data bits: " << static_cast<int>(config.dataBits)
+         << " because the menu selected that word size" << '\n';
+    cout << "  loopback: " << (config.loopback ? "set" : "clear")
+         << " because bytes go " << (config.loopback ? "back to the same UART" : receiverName) << '\n';
+
+    cout << "BAUD_DIV = " << registers.baudDiv << '\n';
+    cout << "  why: derived from 16000000 / " << config.baudRate << " using the selected baud rate" << '\n';
+
+    cout << "STATUS = 0x" << hex << registers.status << dec << '\n';
+    cout << "  tx busy: " << ((registers.status & Uart::StatusTxBusy) != 0U ? "set" : "clear")
+         << " because transmission is " << (uart.hasPendingTx() ? "still running" : "finished") << '\n';
+    cout << "  rx ready: " << ((registers.status & Uart::StatusRxReady) != 0U ? "set" : "clear")
+         << " because received bytes are " << (uart.hasPendingRx() ? "waiting in the buffer" : "already read") << '\n';
+}
+} // namespace
+
+int main(int argc, char* argv[]) {
+    string message = argc > 1 ? argv[1] : "Hello UART";
+
+    cout << "UARTSim setup\n";
+    cout << "Press Enter to accept each default.\n\n";
+
+    message = readLineOrDefault("Message to send", message);
+    const int parityChoice = readIntOrDefault("Parity 0=none 1=even 2=odd", 0, 0, 2);
+    const int stopBitsChoice = readIntOrDefault("Stop bits 1 or 2", 1, 1, 2);
+    const int dataBitsChoice = readIntOrDefault("Data bits 7 or 8", 8, 7, 8);
+    const int baudRateChoice = readIntOrDefault("Baud rate", 9600, 300, 1000000);
+    const bool loopbackChoice = readYesNoOrDefault("Loopback mode y/n", false);
+
+    Uart uart0{"UART0"};
+    Uart uart1{"UART1"};
+    Bus bus;
+
+    Uart::Config config;
+    config.parity = parityFromChoice(parityChoice);
+    config.parityEnabled = config.parity != Uart::ParityMode::None;
+    config.stopBits = static_cast<std::uint8_t>(stopBitsChoice);
+    config.dataBits = static_cast<std::uint8_t>(dataBitsChoice);
+    config.baudRate = static_cast<std::uint32_t>(baudRateChoice);
+    config.loopback = loopbackChoice;
+
+    uart0.configure(config);
+    uart1.configure(config);
+
+    uart0.connectPeer(&uart1);
+    uart1.connectPeer(&uart0);
+    bus.attach(uart0);
+    bus.attach(uart1);
+
+    uart0.send(message);
+
+    cout << "UART demo\n";
+    cout << "Sent: " << message << '\n';
+    printStatusPhase("At transmission time:", uart0);
+
+    int cycle = 0;
+    while (uart0.hasPendingTx()) {
+        ++cycle;
+        bus.tick();
+        printStatusPhase("During transmission cycle " + to_string(cycle) + ":", uart0);
+    }
+
+    Uart& receiver = config.loopback ? uart0 : uart1;
+    const string receiverName = receiver.name();
+
+    printStatusPhase("After transmission:", uart0);
+
+    cout << "\nReceived on " << receiverName << ": ";
+    printBuffer(receiver);
+    cout << '\n';
+
+    printRegisterReport(uart0, receiverName);
+    return 0;
+}
+\end{lstlisting}
+
+\subsection*{Line-by-line explanation}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\textwidth} p{0.82\textwidth}}
+\textbf{Line} & \textbf{Explanation} \\
+\hline
+\endhead
+1 & Includes \file{Bus.hpp} using a relative path so the compiler can find it even if the build is started from \file{src/}. \\
+2 & Includes \file{Uart.hpp} using a relative path for the same reason. \\
+3--6 & Standard library headers for fixed-width integers, console I/O, string parsing, and text handling. \\
+8 & Brings the \texttt{std} names into the global scope to keep the code shorter. \\
+10 & Starts an anonymous namespace so helper functions stay local to this file. \\
+11--17 & \texttt{readLineOrDefault} asks for a text value and returns the fallback if the user presses Enter. \\
+12 & Prints the prompt and the default value. \\
+13--16 & Reads a full line from the console and returns the fallback if the line is empty. \\
+19--33 & \texttt{readIntOrDefault} asks for an integer inside a valid range. \\
+20--21 & Keeps asking until a valid number is entered. \\
+22--25 & Reads the text and uses a \texttt{stringstream} to parse it as an integer. \\
+27--29 & Verifies that the parse succeeded, no extra characters remain, and the value is inside the allowed range. \\
+31 & Prints an error message if the input is invalid. \\
+36--52 & \texttt{readYesNoOrDefault} reads a yes/no choice and accepts \texttt{y}, \texttt{n}, \texttt{yes}, or \texttt{no}. \\
+37 & Converts the fallback boolean into a display string. \\
+38--50 & Repeats until the user enters a valid yes/no value or presses Enter for default. \\
+54--61 & Converts a menu choice into a UART parity mode. \\
+55--57 & Choice 1 means even parity. \\
+58--60 & Choice 2 means odd parity. \\
+61 & Anything else means parity is disabled. \\
+64--72 & Converts a parity mode back into a printable name. \\
+74--80 & Formats the status register as hex plus named bits for easier reading. \\
+75--79 & Builds a string showing \texttt{TX\_BUSY}, \texttt{RX\_READY}, and \texttt{OVERFLOW}. \\
+83--85 & Prints a single status checkpoint with a label. \\
+87--92 & Reads bytes from the receive buffer and prints them as characters. \\
+94--117 & Prints a human-readable report of the UART registers and explains why each field has the value it has. \\
+95--96 & Copies the current register and config state so the report can inspect them. \\
+98 & Starts the per-register explanation block for \texttt{CONTROL}. \\
+99--109 & Explains parity, stop bits, data bits, loopback, and baud divisor. \\
+111--116 & Explains the status register and why \texttt{TX\_BUSY} and \texttt{RX\_READY} are set or clear. \\
+118 & Ends the anonymous namespace. \\
+120--155 & \texttt{main} performs the actual demo. \\
+121 & Uses the first command-line argument as the message, or defaults to \texttt{Hello UART}. \\
+123--124 & Prints the setup banner. \\
+126--130 & Collects the message, parity, stop bits, data bits, baud rate, and loopback option from the user. \\
+132--134 & Creates two UART objects and one bus object. \\
+136--142 & Fills the UART configuration struct from the menu choices. \\
+144--145 & Applies the configuration to both UARTs. \\
+147--149 & Connects the UARTs as peers and attaches them to the bus. \\
+151 & Queues the message for transmission. \\
+153--154 & Prints the initial transmission status before the bus starts ticking. \\
+156--160 & Repeatedly ticks the bus until the transmit buffer becomes empty, printing the status after each cycle. \\
+162--163 & Chooses which UART should be treated as the receiver, depending on loopback mode. \\
+165--166 & Prints the final status after transmission is complete. \\
+168--170 & Prints the received text. \\
+172--173 & Prints the detailed register report. \\
+174 & Returns success. \\
+\end{longtable}
+
+\section*{File: include/Uart.hpp}
+\begin{lstlisting}[style=code]
+#pragma once
+
+#include "CircularBuffer.hpp"
+
+#include <cstdint>
+#include <string>
+#include <utility>
+using namespace std;
+
+class Uart {
+public:
+    enum class ParityMode {
+        None,
+        Even,
+        Odd,
+    };
+
+    struct Config {
+        ParityMode parity = ParityMode::None;
+        bool parityEnabled = false;
+        uint8_t stopBits = 1U;
+        uint8_t dataBits = 8U;
+        uint32_t baudRate = 9600U;
+        bool loopback = false;
+    };
+
+    struct Registers {
+        uint32_t control = 0U;
+        uint32_t baudDiv = 1U;
+        uint32_t status = 0U;
+    };
+
+    enum ControlBit : std::uint32_t {
+        ControlParityEnable = 1U << 0,
+        ControlParityOdd = 1U << 1,
+        ControlTwoStopBits = 1U << 2,
+        ControlSevenDataBits = 1U << 3,
+        ControlLoopback = 1U << 4,
+    };
+
+    enum StatusBit : std::uint32_t {
+        StatusTxBusy = 1U << 0,
+        StatusRxReady = 1U << 1,
+        StatusBufferOverflow = 1U << 2,
+    };
+
+    explicit Uart(std::string name)
+        : name_(std::move(name)) {
+    }
+
+    void connectPeer(Uart* peer) {
+        peer_ = peer;
+    }
+
+    void configure(const Config& config) {
+        config_ = config;
+        if (!config_.parityEnabled) {
+            config_.parity = ParityMode::None;
+        }
+
+        registers_.control = 0U;
+        if (config_.parityEnabled) {
+            registers_.control |= ControlParityEnable;
+            if (config_.parity == ParityMode::Odd) {
+                registers_.control |= ControlParityOdd;
+            }
+        }
+        if (config_.stopBits == 2U) {
+            registers_.control |= ControlTwoStopBits;
+        }
+        if (config_.dataBits == 7U) {
+            registers_.control |= ControlSevenDataBits;
+        }
+        if (config_.loopback) {
+            registers_.control |= ControlLoopback;
+        }
+
+        registers_.baudDiv = config_.baudRate == 0U ? 1U : (BaseClockHz / config_.baudRate);
+        if (registers_.baudDiv == 0U) {
+            registers_.baudDiv = 1U;
+        }
+
+        registers_.status = 0U;
+    }
+
+    void send(const std::string& text) {
+        for (char ch : text) {
+            if (!txBuffer_.push(static_cast<std::uint8_t>(ch))) {
+                registers_.status |= StatusBufferOverflow;
+                break;
+            }
+        }
+
+        if (!txBuffer_.empty()) {
+            registers_.status |= StatusTxBusy;
+        }
+    }
+
+    void tick() {
+        uint8_t byte = 0U;
+        if (!txBuffer_.pop(byte)) {
+            if (txBuffer_.empty()) {
+                registers_.status &= static_cast<std::uint32_t>(~StatusTxBusy);
+            }
+            return;
+        }
+
+        if (config_.loopback) {
+            if (rxBuffer_.push(byte)) {
+                registers_.status |= StatusRxReady;
+            }
+        } else if (peer_ != nullptr) {
+            peer_->rxBuffer_.push(byte);
+            peer_->registers_.status |= StatusRxReady;
+        }
+
+        if (txBuffer_.empty()) {
+            registers_.status &= static_cast<std::uint32_t>(~StatusTxBusy);
+        }
+    }
+
+    bool readReceivedByte(uint8_t& byte) {
+        const bool popped = rxBuffer_.pop(byte);
+        if (rxBuffer_.empty()) {
+            registers_.status &= static_cast<uint32_t>(~StatusRxReady);
+        }
+        return popped;
+    }
+
+    bool hasPendingTx() const {
+        return !txBuffer_.empty();
+    }
+
+    bool hasPendingRx() const {
+        return !rxBuffer_.empty();
+    }
+
+    const string& name() const {
+        return name_;
+    }
+
+    const Config& config() const {
+        return config_;
+    }
+
+    const Registers& registers() const {
+        return registers_;
+    }
+
+private:
+    static constexpr std::uint32_t BaseClockHz = 16000000U;
+
+    string name_;
+    Uart* peer_ = nullptr;
+    Config config_{};
+    Registers registers_{};
+    CircularBuffer<std::uint8_t, 16U> txBuffer_;
+    CircularBuffer<std::uint8_t, 16U> rxBuffer_;
+};
+\end{lstlisting}
+
+\subsection*{Line-by-line explanation}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\textwidth} p{0.82\textwidth}}
+\textbf{Line} & \textbf{Explanation} \\
+\hline
+\endhead
+1 & Prevents multiple inclusion of this header. \\
+3 & Includes the circular buffer template used for transmit and receive storage. \\
+5--6 & Standard headers for fixed-width integers and strings. \\
+7 & Imports \texttt{std} symbols into the header. This works, but in general it is better not to do this in headers. \\
+9 & Starts the \texttt{Uart} class. \\
+10--20 & Defines the parity mode enum. \\
+22--28 & Defines a configuration object that stores user-selected UART options. \\
+30--34 & Defines a register bundle representing control, baud divisor, and status. \\
+36--43 & Defines bit flags for the control register. \\
+45--50 & Defines bit flags for the status register. \\
+52--54 & Constructor stores the UART name. \\
+56--58 & Connects this UART to its peer. \\
+60--81 & Applies the selected configuration and sets the virtual registers accordingly. \\
+61 & Copies the config into the object. \\
+62--64 & Forces parity off if the user disabled it. \\
+66--77 & Builds the control register by setting bits for parity, stop bits, data bits, and loopback. \\
+79--82 & Computes the baud divisor from the fixed base clock. \\
+84 & Clears status bits when configuration is applied. \\
+86--95 & Queues a string into the TX buffer one byte at a time. \\
+88--90 & If the TX buffer is full, marks overflow and stops queuing more bytes. \\
+92--94 & Marks the UART busy when there is pending TX data. \\
+96--114 & One tick transfers one byte. \\
+97--100 & Pops one byte from TX; if nothing is pending, clears busy and returns. \\
+102--106 & If loopback is enabled, the byte goes back into the same UART's RX buffer. \\
+107--110 & Otherwise the byte is pushed into the peer UART's RX buffer and the peer RX-ready bit is set. \\
+112--114 & Clears TX busy when the queue becomes empty. \\
+116--120 & Reads one received byte and clears RX-ready when the RX buffer becomes empty. \\
+122--130 & Status queries and name accessor functions. \\
+132--137 & Accessors for config and registers. \\
+139--147 & Private data members holding the name, peer pointer, config, registers, and buffers. \\
+140 & Base clock used to derive baud divisor. \\
+\end{longtable}
+
+\section*{File: include/Bus.hpp}
+\begin{lstlisting}[style=code]
+#pragma once
+
+#include "Uart.hpp"
+
+#include <vector>
+
+class Bus {
+public:
+    void attach(Uart& uart) {
+        uarts_.push_back(&uart);
+    }
+
+    void tick() {
+        for (Uart* uart : uarts_) {
+            uart->tick();
+        }
+    }
+
+private:
+    std::vector<Uart*> uarts_;
+};
+\end{lstlisting}
+
+\subsection*{Line-by-line explanation}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\textwidth} p{0.82\textwidth}}
+\textbf{Line} & \textbf{Explanation} \\
+\hline
+\endhead
+1 & Prevents multiple inclusion. \\
+3 & Includes the UART class definition because the bus stores UART pointers. \\
+5 & Includes \texttt{vector} so the bus can hold a dynamic list of UARTs. \\
+7 & Declares the bus class. \\
+8--10 & \texttt{attach} stores a UART pointer in the internal list. \\
+12--16 & \texttt{tick} loops over all attached UARTs and calls their \texttt{tick()} method. \\
+18--19 & The bus stores pointers to UART objects. \\
+\end{longtable}
+
+\section*{File: include/CircularBuffer.hpp}
+\begin{lstlisting}[style=code]
+#pragma once
+
+#include <array>
+#include <cstddef>
+using namespace std;
+template <typename T, std::size_t Capacity>
+class CircularBuffer {
+public:
+    bool push(const T& value) {
+        if (count_ == Capacity) {
+            return false;
+        }
+
+        values_[tail_] = value;
+        tail_ = (tail_ + 1U) % Capacity;
+        ++count_;
+        return true;
+    }
+
+    bool pop(T& value) {
+        if (count_ == 0U) {
+            return false;
+        }
+
+        value = values_[head_];
+        head_ = (head_ + 1U) % Capacity;
+        --count_;
+        return true;
+    }
+
+    bool empty() const {
+        return count_ == 0U;
+    }
+
+    bool full() const {
+        return count_ == Capacity;
+    }
+
+private:
+    array<T, Capacity> values_{};
+    size_t head_ = 0U;
+    size_t tail_ = 0U;
+    size_t count_ = 0U;
+};
+\end{lstlisting}
+
+\subsection*{Line-by-line explanation}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\textwidth} p{0.82\textwidth}}
+\textbf{Line} & \textbf{Explanation} \\
+\hline
+\endhead
+1 & Prevents multiple inclusion. \\
+3--4 & Includes \texttt{array} for fixed-size storage and \texttt{cstddef} for \texttt{size\_t}. \\
+5 & Imports \texttt{std} symbols into the header. This is convenient but not ideal in headers. \\
+6 & Begins the template declaration for a circular buffer storing type \texttt{T} with capacity \texttt{Capacity}. \\
+7 & Starts the class definition. \\
+8--17 & \texttt{push} inserts a value if the buffer is not full. \\
+9--11 & Returns false when the buffer is already full. \\
+13--15 & Stores the new value, advances the tail index, and increments the element count. \\
+18--27 & \texttt{pop} removes a value if the buffer is not empty. \\
+19--21 & Returns false when the buffer is empty. \\
+23--25 & Copies out the front value, advances the head index, and decrements the count. \\
+28--30 & Returns whether the buffer currently holds zero elements. \\
+32--34 & Returns whether the buffer is completely full. \\
+36--40 & Internal storage and state variables for the ring buffer. \\
+37 & Fixed-size array holding the actual items. \\
+38--40 & Indices and count used to manage wraparound behavior. \\
+\end{longtable}
+
+\section*{File: README.md}
+The README explains the project at a high level. It says the program is a small C++17 console UART simulator with a text-based setup menu, shows how to build it with \file{build.bat}, and says to run \file{run.bat}. It also tells the user to enter message text, parity, stop bits, data bits, baud rate, and loopback in the menu.
+
+\section*{File: CMakeLists.txt}
+The CMake file defines a C++17 project named \texttt{UARTSim}, builds one executable from \file{src/main.cpp}, adds \file{include/} to the include path, and enables warnings. That means the project is intentionally simple: the logic lives in headers, and the program entry point is in one source file.
+
+\section*{How the files work together}
+\begin{itemize}[leftmargin=*]
+  \item \file{main.cpp} is the driver. It reads user input, configures UART objects, starts transmission, and prints output.
+  \item \file{Uart.hpp} is the core model. It stores configuration, register values, and the TX/RX buffers.
+  \item \file{Bus.hpp} is the scheduler. It calls \texttt{tick()} repeatedly to simulate time passing.
+  \item \file{CircularBuffer.hpp} is the utility container that makes the TX and RX queues work.
+\end{itemize}
+
+\section*{Important note}
+The current headers contain \texttt{using namespace std;} inside the header files. The code still compiles, but in real projects it is better to avoid that in headers because it can leak names into other files.
+
+\end{document}
